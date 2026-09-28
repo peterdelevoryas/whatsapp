@@ -1,0 +1,34 @@
+[Unit]
+Description=WhatsApp MCP proxy
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=whatsapp
+Group=whatsapp
+Environment=WHATSAPP_TOKENS=/etc/whatsapp/tokens
+Environment=WHATSAPP_ADDR=127.0.0.1:8751
+Environment=WHATSAPP_ALLOWED_HOSTS=@DOMAIN@
+# Cloud API credentials and WHATSAPP_OWNER; written by deploy/secrets.sh.
+EnvironmentFile=/etc/whatsapp/env
+ExecStart=/usr/local/bin/whatsapp serve
+# Re-reads the tokens file without a restart.
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

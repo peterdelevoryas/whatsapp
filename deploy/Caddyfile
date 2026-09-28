@@ -1,0 +1,13 @@
+@DOMAIN@ {
+	log {
+		output stderr
+		format json
+	}
+	reverse_proxy 127.0.0.1:8751 {
+		# While the server restarts (deploys), hold requests and retry the
+		# connection instead of failing them. Only requests that never reached
+		# the server are retried, so a message is never sent twice.
+		lb_try_duration 15s
+		lb_try_interval 250ms
+	}
+}

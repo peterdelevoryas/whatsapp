@@ -1,0 +1,4 @@
+/target
+/.env
+/tokens
+/deploy/config
