@@ -1,13 +1,12 @@
 //! `/webhook`: incoming messages from the WhatsApp Cloud API. Meta signs each
 //! delivery with the app secret; unsigned or badly signed requests are
 //! rejected. Messages from anyone who isn't a contact are dropped without a
-//! reply, so a stranger can't tell the number is live. Contacts' text messages
-//! are forwarded to the agent's input endpoint, if one is configured.
+//! reply, so a stranger can't tell the number is live. Contacts' messages are
+//! logged, and text messages are forwarded to the agent's input endpoint, if
+//! one is configured. Delivery statuses for messages this number sent are
+//! logged too.
 
-use std::{
-    collections::{HashSet, VecDeque},
-    sync::{Arc, Mutex},
-};
+use std::sync::Arc;
 
 use axum::{
     body::Bytes,
@@ -16,14 +15,14 @@ use axum::{
 };
 use hmac::{Hmac, KeyInit, Mac};
 
-use crate::contacts::Contacts;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::Sha256;
 
-// Meta redelivers a message if it doesn't see our 200 in time; remember this
-// many recent message IDs so the agent gets each one once.
-const SEEN_CAPACITY: usize = 1000;
+use crate::{
+    contacts::Contacts,
+    store::{self, Incoming, Store},
+};
 
 #[derive(Clone)]
 pub struct Webhook(Arc<Inner>);
@@ -33,8 +32,8 @@ struct Inner {
     verify_token: String,
     contacts: Arc<Contacts>,
     agent: Option<Agent>,
+    store: Store,
     http: reqwest::Client,
-    seen: Mutex<Seen>,
 }
 
 pub struct Agent {
@@ -44,41 +43,21 @@ pub struct Agent {
     pub token: String,
 }
 
-#[derive(Default)]
-struct Seen {
-    ids: HashSet<String>,
-    order: VecDeque<String>,
-}
-
-impl Seen {
-    /// Records `id`; false if it was already seen.
-    fn insert(&mut self, id: &str) -> bool {
-        if !self.ids.insert(id.to_string()) {
-            return false;
-        }
-        self.order.push_back(id.to_string());
-        if self.order.len() > SEEN_CAPACITY {
-            let oldest = self.order.pop_front().unwrap();
-            self.ids.remove(&oldest);
-        }
-        true
-    }
-}
-
 impl Webhook {
     pub fn new(
         app_secret: String,
         verify_token: String,
         contacts: Arc<Contacts>,
         agent: Option<Agent>,
+        store: Store,
     ) -> Self {
         Self(Arc::new(Inner {
             app_secret,
             verify_token,
             contacts,
             agent,
+            store,
             http: reqwest::Client::new(),
-            seen: Mutex::new(Seen::default()),
         }))
     }
 }
@@ -107,8 +86,9 @@ pub async fn verify(
     p.challenge.ok_or(StatusCode::BAD_REQUEST)
 }
 
-/// `POST /webhook`: a delivery from Meta. Answers right away; forwarding to
-/// the agent happens in the background, since an agent turn can take minutes.
+/// `POST /webhook`: a delivery from Meta. Answers once everything is logged;
+/// forwarding to the agent happens in the background, since an agent turn can
+/// take minutes. If logging fails, Meta gets a 500 and redelivers later.
 pub async fn receive(
     State(Webhook(w)): State<Webhook>,
     headers: HeaderMap,
@@ -144,12 +124,31 @@ pub async fn receive(
             );
             continue;
         };
-        if !w.seen.lock().unwrap().insert(id) {
-            tracing::info!(id, "ignored redelivered message");
-            continue;
+        let text = message["text"]["body"].as_str();
+        let at = message["timestamp"]
+            .as_str()
+            .and_then(store::from_unix)
+            .unwrap_or_else(store::now);
+        let incoming = Incoming {
+            id,
+            contact: from,
+            kind,
+            text,
+            at,
+        };
+        match w.store.record_incoming(incoming).await {
+            Ok(true) => {}
+            Ok(false) => {
+                tracing::info!(id, "ignored redelivered message");
+                continue;
+            }
+            Err(e) => {
+                tracing::error!(id, "logging message failed: {e:#}");
+                return StatusCode::INTERNAL_SERVER_ERROR;
+            }
         }
-        let Some(text) = message["text"]["body"].as_str() else {
-            tracing::info!(id, kind, "ignored non-text message");
+        let Some(text) = text else {
+            tracing::info!(id, kind, "logged non-text message; not forwarded");
             continue;
         };
         let input = json!({
@@ -162,17 +161,44 @@ pub async fn receive(
         let w = w.clone();
         tokio::spawn(async move { forward(&w, input).await });
     }
+    for status in statuses(&payload) {
+        let id = status["id"].as_str().unwrap_or_default();
+        let state = status["status"].as_str().unwrap_or_default();
+        let at = status["timestamp"]
+            .as_str()
+            .and_then(store::from_unix)
+            .unwrap_or_else(store::now);
+        let error = status["errors"][0]["title"]
+            .as_str()
+            .or(status["errors"][0]["message"].as_str());
+        if let Err(e) = w.store.record_status(id, state, at, error).await {
+            tracing::error!(id, "logging status failed: {e:#}");
+            return StatusCode::INTERNAL_SERVER_ERROR;
+        }
+        if state == "failed" {
+            tracing::warn!(id, error = error.unwrap_or_default(), "message failed");
+        }
+    }
     StatusCode::OK
 }
 
-/// Every incoming message in a delivery. Deliveries also carry status updates
-/// (sent, delivered, read) for our own messages; those are skipped.
+/// Every incoming message in a delivery.
 fn messages(payload: &Value) -> Vec<&Value> {
+    values(payload, "messages")
+}
+
+/// Every status update (sent, delivered, read, failed) for messages this
+/// number sent.
+fn statuses(payload: &Value) -> Vec<&Value> {
+    values(payload, "statuses")
+}
+
+fn values<'a>(payload: &'a Value, field: &str) -> Vec<&'a Value> {
     let mut out = Vec::new();
     for entry in payload["entry"].as_array().into_iter().flatten() {
         for change in entry["changes"].as_array().into_iter().flatten() {
-            for message in change["value"]["messages"].as_array().into_iter().flatten() {
-                out.push(message);
+            for value in change["value"][field].as_array().into_iter().flatten() {
+                out.push(value);
             }
         }
     }
@@ -240,7 +266,7 @@ mod tests {
     }
 
     #[test]
-    fn finds_messages_and_skips_statuses() {
+    fn separates_messages_and_statuses() {
         let payload = json!({"entry": [{"changes": [
             {"value": {"messages": [{"from": "1", "id": "a", "type": "text", "text": {"body": "hi"}}]}},
             {"value": {"statuses": [{"id": "b", "status": "read"}]}}
@@ -248,16 +274,8 @@ mod tests {
         let found = messages(&payload);
         assert_eq!(found.len(), 1);
         assert_eq!(found[0]["id"], "a");
-    }
-
-    #[test]
-    fn seen_forgets_oldest() {
-        let mut seen = Seen::default();
-        assert!(seen.insert("a"));
-        assert!(!seen.insert("a"));
-        for i in 0..SEEN_CAPACITY {
-            seen.insert(&i.to_string());
-        }
-        assert!(seen.insert("a"));
+        let found = statuses(&payload);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0]["id"], "b");
     }
 }

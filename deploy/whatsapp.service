@@ -1,20 +1,27 @@
 [Unit]
-Description=WhatsApp MCP proxy
+Description=WhatsApp relay
+# The message log lives on a block-storage volume mounted here.
+RequiresMountsFor=/var/lib/whatsapp
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 User=whatsapp
 Group=whatsapp
+Environment=WHATSAPP_DB=/var/lib/whatsapp/whatsapp.db
 Environment=WHATSAPP_TOKENS=/etc/whatsapp/tokens
 Environment=WHATSAPP_ADDR=127.0.0.1:8751
 Environment=WHATSAPP_ALLOWED_HOSTS=@DOMAIN@
 # Cloud API credentials and WHATSAPP_CONTACTS; written by deploy/secrets.sh.
 EnvironmentFile=/etc/whatsapp/env
+# Never start on an empty directory if the volume failed to mount.
+ExecStartPre=/usr/bin/mountpoint -q /var/lib/whatsapp
 ExecStart=/usr/local/bin/whatsapp serve
 # Re-reads the tokens file without a restart.
 ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
+StateDirectory=whatsapp
+StateDirectoryMode=0700
 
 NoNewPrivileges=true
 ProtectSystem=strict

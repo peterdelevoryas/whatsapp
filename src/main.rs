@@ -1,6 +1,8 @@
 mod auth;
 mod contacts;
+mod health;
 mod server;
+mod store;
 mod webhook;
 mod whatsapp;
 
@@ -25,6 +27,8 @@ environment:
   WHATSAPP_VERIFY_TOKEN     shared secret for Meta's webhook verification (required)
   WHATSAPP_AGENT_URL        where to forward incoming messages (default: don't forward, just log)
   WHATSAPP_AGENT_TOKEN      bearer token for WHATSAPP_AGENT_URL
+  WHATSAPP_DB               message log database (default: whatsapp.db)
+  WHATSAPP_DISK_MAX_PERCENT /health fails above this disk use (default: 85)
   WHATSAPP_TOKENS           client tokens file (default: tokens)
   WHATSAPP_ADDR             listen address (default: 127.0.0.1:8751)
   WHATSAPP_ALLOWED_HOSTS    comma-separated Host headers to accept (default: localhost)";
@@ -75,6 +79,7 @@ async fn serve() -> Result<()> {
         }),
         Err(_) => None,
     };
+    let db_path = env("WHATSAPP_DB", "whatsapp.db");
     let tokens_path = PathBuf::from(env("WHATSAPP_TOKENS", "tokens"));
     let addr = env("WHATSAPP_ADDR", "127.0.0.1:8751");
     let mut allowed_hosts = Vec::new();
@@ -85,13 +90,29 @@ async fn serve() -> Result<()> {
         }
     }
 
+    let store = store::Store::open(&db_path).await?;
+    let health = health::Health::new(health::Config {
+        store: store.clone(),
+        data_dir: std::path::Path::new(&db_path)
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(std::path::Path::new("."))
+            .to_path_buf(),
+        max_disk_percent: env("WHATSAPP_DISK_MAX_PERCENT", "85").parse()?,
+    });
     let whatsapp = whatsapp::Client::new(access_token, phone_number_id);
     tracing::info!(
         contacts = ?contacts.names(),
         forwarding = agent.is_some(),
         "configured"
     );
-    let webhook = webhook::Webhook::new(app_secret, verify_token, contacts.clone(), agent);
+    let webhook = webhook::Webhook::new(
+        app_secret,
+        verify_token,
+        contacts.clone(),
+        agent,
+        store.clone(),
+    );
     let tokens = auth::Tokens::load(&tokens_path)?;
 
     let mcp = StreamableHttpService::new(
@@ -99,6 +120,7 @@ async fn serve() -> Result<()> {
             Ok(server::WhatsAppServer::new(
                 whatsapp.clone(),
                 contacts.clone(),
+                store.clone(),
             ))
         },
         // No sessions: every request stands alone, so a restart never strands a
@@ -116,7 +138,10 @@ async fn serve() -> Result<()> {
             auth::middleware,
         ))
         // Unauthenticated, for an external monitor; outside the auth layer.
-        .route("/health", axum::routing::get(|| async { "ok\n" }))
+        .route(
+            "/health",
+            axum::routing::get(health::handler).with_state(health),
+        )
         // Authenticated by Meta's signature instead of a bearer token.
         .route(
             "/webhook",
@@ -139,7 +164,7 @@ async fn serve() -> Result<()> {
     let listener = tokio::net::TcpListener::bind(&addr)
         .await
         .with_context(|| format!("binding {addr}"))?;
-    tracing::info!("listening on http://{addr}/mcp");
+    tracing::info!("listening on http://{addr}/mcp (db: {db_path})");
     axum::serve(listener, app)
         // Finish in-flight requests on SIGTERM (systemctl stop/restart) or Ctrl-C.
         .with_graceful_shutdown(async {

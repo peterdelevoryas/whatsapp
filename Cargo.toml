@@ -6,8 +6,10 @@ edition = "2024"
 [dependencies]
 anyhow = "1.0.104"
 axum = "0.8.9"
+chrono = "0.4.45"
 hex = "0.4.3"
 hmac = "0.13.0"
+libc = "0.2.189"
 rand = "0.10.3"
 reqwest = { version = "0.13.5", features = ["json"] }
 rmcp = { version = "=3.4.1", features = ["server", "macros", "transport-streamable-http-server"] }
@@ -18,3 +20,4 @@ sha2 = "0.11.0"
 tokio = { version = "1.53.1", features = ["full"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+turso = "=0.7.2"
