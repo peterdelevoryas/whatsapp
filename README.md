@@ -71,11 +71,17 @@ the service won't start unless that path is a mount point, so a missing volume c
 - Tokens: `deploy/token.sh <source>` mints a token on the server (which stores only its hash), reloads the tokens
   file without a restart, and saves the token in the macOS keychain (`whatsapp-mcp-token` / `<source>`). Revoke by
   deleting the line from `/etc/whatsapp/tokens` and running `systemctl reload whatsapp`.
-- Health: `GET /health` (no auth) returns 200 when the database answers and its disk is under 85% full, 503 with
-  the problems otherwise. It reveals no messages.
+- Health: `GET /health` (no auth) returns 200 when the database answers, the last backup is under 26 hours old,
+  and its disk is under 85% full; 503 with the problems otherwise. It reveals no messages.
+- Backups: `whatsapp-backup.timer` runs nightly at 03:45 UTC. It stops the server for a few seconds (Caddy holds
+  requests meanwhile), then pushes a tarball of `/var/lib/whatsapp` over rsync+SSH to `BACKUP_TARGET` (`user@host`,
+  and optionally `BACKUP_SSH_PORT`, set in `/etc/whatsapp/backup.env` on the server, with the key in
+  `/etc/whatsapp/backup_key`), into `backups/`, keeping 30 days. The volume survives losing the server, but not a bad
+  migration, a bug, or a corrupted file; the backups are the way back from those. Give the backups their own account
+  on the backup host (e.g. a Storage Box sub-account), so the relay's server can't reach anything else there.
 - The volume's ext4 filesystem is labeled `whatsapp-data` (`e2label <device> whatsapp-data` once, for a new
   volume), and `cloud-init.yaml` mounts that label at `/var/lib/whatsapp`. Moving to a new server: create it with
-  `cloud-init.yaml`, run `deploy/secrets.sh` and copy `/etc/whatsapp/tokens` over, stop `whatsapp` on the old
+  `cloud-init.yaml`, run `deploy/secrets.sh` and copy `/etc/whatsapp/{tokens,backup.env,backup_key}` over, stop `whatsapp` on the old
   server, move the volume, reboot the new server so it mounts, and run `deploy/deploy.sh`.
 
 Outgoing requests to the Cloud API use IPv4 only: sends from some IPv6 addresses (seen from a Hetzner VM) fail with

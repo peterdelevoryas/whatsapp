@@ -12,13 +12,15 @@ DOMAIN=$1
 cd /root/src/whatsapp
 ~/.cargo/bin/cargo build --release --locked
 install -m 0755 target/release/whatsapp /usr/local/bin/whatsapp
+install -m 0755 deploy/backup.sh /usr/local/bin/whatsapp-backup
+install -m 0644 deploy/whatsapp-backup.service deploy/whatsapp-backup.timer /etc/systemd/system/
 # The domain lives in the untracked deploy/config, not in the repo.
 sed "s/@DOMAIN@/$DOMAIN/g" deploy/whatsapp.service > /etc/systemd/system/whatsapp.service
 sed "s/@DOMAIN@/$DOMAIN/g" deploy/Caddyfile > /etc/caddy/Caddyfile
 touch /etc/whatsapp/tokens && chown root:whatsapp /etc/whatsapp/tokens && chmod 0640 /etc/whatsapp/tokens
 [ -f /etc/whatsapp/env ] || { echo "missing /etc/whatsapp/env; run deploy/secrets.sh first" >&2; exit 1; }
 systemctl daemon-reload
-systemctl enable --now whatsapp
+systemctl enable --now whatsapp whatsapp-backup.timer
 systemctl restart whatsapp
 systemctl reload caddy
 systemctl --no-pager --lines=5 status whatsapp

@@ -1,0 +1,6 @@
+[Unit]
+Description=Back up the whatsapp database to another machine
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/whatsapp-backup

@@ -29,6 +29,8 @@ environment:
   WHATSAPP_AGENT_TOKEN      bearer token for WHATSAPP_AGENT_URL
   WHATSAPP_DB               message log database (default: whatsapp.db)
   WHATSAPP_DISK_MAX_PERCENT /health fails above this disk use (default: 85)
+  WHATSAPP_BACKUP_STAMP     file with the last backup's time; /health checks its age (default: no check)
+  WHATSAPP_BACKUP_MAX_AGE_HOURS  /health fails when the last backup is older (default: 26)
   WHATSAPP_TOKENS           client tokens file (default: tokens)
   WHATSAPP_ADDR             listen address (default: 127.0.0.1:8751)
   WHATSAPP_ALLOWED_HOSTS    comma-separated Host headers to accept (default: localhost)";
@@ -99,6 +101,10 @@ async fn serve() -> Result<()> {
             .unwrap_or(std::path::Path::new("."))
             .to_path_buf(),
         max_disk_percent: env("WHATSAPP_DISK_MAX_PERCENT", "85").parse()?,
+        backup_stamp: std::env::var("WHATSAPP_BACKUP_STAMP")
+            .ok()
+            .map(PathBuf::from),
+        max_backup_age_hours: env("WHATSAPP_BACKUP_MAX_AGE_HOURS", "26").parse()?,
     });
     let whatsapp = whatsapp::Client::new(access_token, phone_number_id);
     tracing::info!(

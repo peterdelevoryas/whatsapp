@@ -1,5 +1,6 @@
 //! `GET /health`: an unauthenticated summary for an external monitor. It
-//! reports whether the message log answers and how full its disk is: 200 when
+//! reports whether the message log answers, how old the last successful backup
+//! is (backup.sh writes a timestamp file), and how full the disk is: 200 when
 //! all is well, 503 with the problems otherwise. It reveals no messages.
 
 use std::{path::PathBuf, sync::Arc};
@@ -17,6 +18,10 @@ pub struct Config {
     /// Directory whose filesystem is checked for free space (the database's).
     pub data_dir: PathBuf,
     pub max_disk_percent: f64,
+    /// File holding the RFC 3339 time of the last successful backup; no
+    /// backup check when unset.
+    pub backup_stamp: Option<PathBuf>,
+    pub max_backup_age_hours: f64,
 }
 
 impl Health {
@@ -30,6 +35,8 @@ pub struct Report {
     pub ok: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub messages: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backup_age_hours: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub disk_used_percent: Option<f64>,
     pub problems: Vec<String>,
@@ -59,9 +66,25 @@ pub async fn handler(State(Health(c)): State<Health>) -> (StatusCode, Json<Repor
             c.max_disk_percent
         ));
     }
+    let mut backup_age = None;
+    if let Some(path) = &c.backup_stamp {
+        match backup_age_hours(path) {
+            Ok(age) => {
+                if age > c.max_backup_age_hours {
+                    problems.push(format!(
+                        "last backup was {age:.1} hours ago (limit {:.0})",
+                        c.max_backup_age_hours
+                    ));
+                }
+                backup_age = Some((age * 10.0).round() / 10.0);
+            }
+            Err(e) => problems.push(format!("backup: {e}")),
+        }
+    }
     let report = Report {
         ok: problems.is_empty(),
         messages,
+        backup_age_hours: backup_age,
         disk_used_percent: disk.map(|d| d.round()),
         problems,
     };
@@ -72,6 +95,14 @@ pub async fn handler(State(Health(c)): State<Health>) -> (StatusCode, Json<Repor
         StatusCode::SERVICE_UNAVAILABLE
     };
     (status, Json(report))
+}
+
+fn backup_age_hours(path: &std::path::Path) -> Result<f64, String> {
+    let text =
+        std::fs::read_to_string(path).map_err(|e| format!("can't read {}: {e}", path.display()))?;
+    let at = chrono::DateTime::parse_from_rfc3339(text.trim())
+        .map_err(|e| format!("bad timestamp in {}: {e}", path.display()))?;
+    Ok((chrono::Utc::now() - at.with_timezone(&chrono::Utc)).num_minutes() as f64 / 60.0)
 }
 
 fn disk_used_percent(dir: &std::path::Path) -> std::io::Result<f64> {

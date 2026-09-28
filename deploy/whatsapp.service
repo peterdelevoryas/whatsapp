@@ -9,6 +9,7 @@ Wants=network-online.target
 User=whatsapp
 Group=whatsapp
 Environment=WHATSAPP_DB=/var/lib/whatsapp/whatsapp.db
+Environment=WHATSAPP_BACKUP_STAMP=/var/lib/whatsapp/last-backup
 Environment=WHATSAPP_TOKENS=/etc/whatsapp/tokens
 Environment=WHATSAPP_ADDR=127.0.0.1:8751
 Environment=WHATSAPP_ALLOWED_HOSTS=@DOMAIN@
