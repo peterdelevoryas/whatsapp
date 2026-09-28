@@ -1,9 +1,10 @@
 mod auth;
+mod contacts;
 mod server;
 mod webhook;
 mod whatsapp;
 
-use std::{collections::HashSet, path::PathBuf, sync::Arc};
+use std::{path::PathBuf, sync::Arc};
 
 use anyhow::{Context, Result, bail};
 use rmcp::transport::streamable_http_server::{
@@ -13,16 +14,15 @@ use tokio::signal::unix::{SignalKind, signal};
 
 const USAGE: &str = "\
 usage:
-  whatsapp serve            run the MCP server
+  whatsapp serve            run the relay (MCP send tool and webhook)
   whatsapp token <source>   mint a client token
 
 environment:
   WHATSAPP_ACCESS_TOKEN     Cloud API access token (required)
   WHATSAPP_PHONE_NUMBER_ID  the sending number's ID (required)
-  WHATSAPP_OWNER            the user's number, digits with country code; the only recipient (required)
+  WHATSAPP_CONTACTS         name=number pairs, comma-separated; the only people it talks to (required)
   WHATSAPP_APP_SECRET       Meta app secret, for checking webhook signatures (required)
   WHATSAPP_VERIFY_TOKEN     shared secret for Meta's webhook verification (required)
-  WHATSAPP_ALLOWED_SENDERS  comma-separated numbers whose messages are accepted (default: WHATSAPP_OWNER)
   WHATSAPP_AGENT_URL        where to forward incoming messages (default: don't forward, just log)
   WHATSAPP_AGENT_TOKEN      bearer token for WHATSAPP_AGENT_URL
   WHATSAPP_TOKENS           client tokens file (default: tokens)
@@ -63,20 +63,11 @@ async fn serve() -> Result<()> {
     let required = |k: &str| std::env::var(k).with_context(|| format!("{k} not set"));
     let access_token = required("WHATSAPP_ACCESS_TOKEN")?;
     let phone_number_id = required("WHATSAPP_PHONE_NUMBER_ID")?;
-    let owner = required("WHATSAPP_OWNER")?;
-    if owner.is_empty() || !owner.chars().all(|c| c.is_ascii_digit()) {
-        bail!("WHATSAPP_OWNER must be digits with country code, no + (e.g. 16505551234)");
-    }
+    let contacts = Arc::new(
+        contacts::Contacts::parse(&required("WHATSAPP_CONTACTS")?).context("WHATSAPP_CONTACTS")?,
+    );
     let app_secret = required("WHATSAPP_APP_SECRET")?;
     let verify_token = required("WHATSAPP_VERIFY_TOKEN")?;
-    let mut allowed_senders = HashSet::new();
-    for number in env("WHATSAPP_ALLOWED_SENDERS", &owner).split(',') {
-        let number = number.trim();
-        if number.is_empty() || !number.chars().all(|c| c.is_ascii_digit()) {
-            bail!("WHATSAPP_ALLOWED_SENDERS: {number:?} isn't digits with country code");
-        }
-        allowed_senders.insert(number.to_string());
-    }
     let agent = match std::env::var("WHATSAPP_AGENT_URL") {
         Ok(url) => Some(webhook::Agent {
             url,
@@ -96,15 +87,20 @@ async fn serve() -> Result<()> {
 
     let whatsapp = whatsapp::Client::new(access_token, phone_number_id);
     tracing::info!(
-        allowed_senders = allowed_senders.len(),
+        contacts = ?contacts.names(),
         forwarding = agent.is_some(),
-        "webhook configured"
+        "configured"
     );
-    let webhook = webhook::Webhook::new(app_secret, verify_token, allowed_senders, agent);
+    let webhook = webhook::Webhook::new(app_secret, verify_token, contacts.clone(), agent);
     let tokens = auth::Tokens::load(&tokens_path)?;
 
     let mcp = StreamableHttpService::new(
-        move || Ok(server::WhatsAppServer::new(whatsapp.clone(), owner.clone())),
+        move || {
+            Ok(server::WhatsAppServer::new(
+                whatsapp.clone(),
+                contacts.clone(),
+            ))
+        },
         // No sessions: every request stands alone, so a restart never strands a
         // connected client.
         Arc::new(NeverSessionManager::default()),

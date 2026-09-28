@@ -57,7 +57,7 @@ impl Client {
                 .unwrap_or("unknown error");
             if reply["error"]["code"].as_i64() == Some(OUTSIDE_WINDOW) {
                 bail!(
-                    "WhatsApp only delivers free-form messages within 24 hours of the user's last message to this number, and that window has closed; they need to message it first ({message})"
+                    "WhatsApp only delivers free-form messages within 24 hours of the contact's last message to this number, and that window has closed; they need to message it first ({message})"
                 );
             }
             bail!("WhatsApp API returned {status}: {message}");

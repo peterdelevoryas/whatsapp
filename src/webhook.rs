@@ -1,7 +1,7 @@
 //! `/webhook`: incoming messages from the WhatsApp Cloud API. Meta signs each
 //! delivery with the app secret; unsigned or badly signed requests are
-//! rejected. Messages from numbers outside the allowlist are dropped without
-//! a reply, so a stranger can't tell the number is live. Allowed text messages
+//! rejected. Messages from anyone who isn't a contact are dropped without a
+//! reply, so a stranger can't tell the number is live. Contacts' text messages
 //! are forwarded to the agent's input endpoint, if one is configured.
 
 use std::{
@@ -15,6 +15,8 @@ use axum::{
     http::{HeaderMap, StatusCode},
 };
 use hmac::{Hmac, KeyInit, Mac};
+
+use crate::contacts::Contacts;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::Sha256;
@@ -29,7 +31,7 @@ pub struct Webhook(Arc<Inner>);
 struct Inner {
     app_secret: String,
     verify_token: String,
-    allowed_senders: HashSet<String>,
+    contacts: Arc<Contacts>,
     agent: Option<Agent>,
     http: reqwest::Client,
     seen: Mutex<Seen>,
@@ -67,13 +69,13 @@ impl Webhook {
     pub fn new(
         app_secret: String,
         verify_token: String,
-        allowed_senders: HashSet<String>,
+        contacts: Arc<Contacts>,
         agent: Option<Agent>,
     ) -> Self {
         Self(Arc::new(Inner {
             app_secret,
             verify_token,
-            allowed_senders,
+            contacts,
             agent,
             http: reqwest::Client::new(),
             seen: Mutex::new(Seen::default()),
@@ -130,7 +132,7 @@ pub async fn receive(
         let from = message["from"].as_str().unwrap_or_default();
         let id = message["id"].as_str().unwrap_or_default();
         let kind = message["type"].as_str().unwrap_or_default();
-        if !w.allowed_senders.contains(from) {
+        let Some(contact) = w.contacts.by_number(from) else {
             // Only the last digits: enough to recognize a number, without
             // keeping strangers' full numbers in the logs.
             let suffix = &from[from.len().saturating_sub(4)..];
@@ -138,10 +140,10 @@ pub async fn receive(
                 kind,
                 sender_suffix = suffix,
                 sender_digits = from.len(),
-                "dropped message from a sender not on the allowlist"
+                "dropped message from a sender who isn't a contact"
             );
             continue;
-        }
+        };
         if !w.seen.lock().unwrap().insert(id) {
             tracing::info!(id, "ignored redelivered message");
             continue;
@@ -153,6 +155,7 @@ pub async fn receive(
         let input = json!({
             "channel": "whatsapp",
             "sender": from,
+            "sender_name": contact.name,
             "message_id": id,
             "text": text,
         });

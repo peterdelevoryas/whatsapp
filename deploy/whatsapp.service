@@ -9,7 +9,7 @@ Group=whatsapp
 Environment=WHATSAPP_TOKENS=/etc/whatsapp/tokens
 Environment=WHATSAPP_ADDR=127.0.0.1:8751
 Environment=WHATSAPP_ALLOWED_HOSTS=@DOMAIN@
-# Cloud API credentials and WHATSAPP_OWNER; written by deploy/secrets.sh.
+# Cloud API credentials and WHATSAPP_CONTACTS; written by deploy/secrets.sh.
 EnvironmentFile=/etc/whatsapp/env
 ExecStart=/usr/local/bin/whatsapp serve
 # Re-reads the tokens file without a restart.

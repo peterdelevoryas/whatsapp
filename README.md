@@ -1,12 +1,13 @@
 # whatsapp
 
-A WhatsApp proxy for a personal agent, on the official WhatsApp Cloud API. It does two things:
+A WhatsApp relay: one WhatsApp number, on the official Cloud API, given to an agent as its own phone. It does two
+things:
 
-- **Send:** an MCP server with one tool, `whatsapp_send(text)`, which messages the owner. The recipient is fixed in
-  config, so a leaked client token can only message you.
-- **Receive:** a webhook for incoming messages. It checks Meta's `X-Hub-Signature-256`, drops senders that aren't on
-  the allowlist (without replying, so strangers can't tell the number is live), and forwards text messages to the
-  agent's input endpoint as `{"channel": "whatsapp", "sender", "message_id", "text"}`.
+- **Send:** an MCP server with one tool, `whatsapp_send(to, text)`, which messages one of the number's contacts by
+  name. It can't message anyone else, so a leaked client token can't be used to spam strangers.
+- **Receive:** a webhook for incoming messages. It checks Meta's `X-Hub-Signature-256`, drops messages from anyone
+  who isn't a contact (without replying, so strangers can't tell the number is live), and forwards text messages to
+  the agent's input endpoint as `{"channel": "whatsapp", "sender", "sender_name", "message_id", "text"}`.
 
 The agent never talks to WhatsApp directly; it only sees incoming messages and an MCP send tool.
 
@@ -26,10 +27,9 @@ Environment (`.env`, untracked):
 |---|---|
 | `WHATSAPP_ACCESS_TOKEN` | Cloud API token (a system user's, so it doesn't expire) |
 | `WHATSAPP_PHONE_NUMBER_ID` | the sending number's ID |
-| `WHATSAPP_OWNER` | your number, digits with country code; the only recipient |
+| `WHATSAPP_CONTACTS` | `name=number` pairs, comma-separated (numbers are digits with country code); the only people it talks to |
 | `WHATSAPP_APP_SECRET` | the Meta app's secret, for webhook signatures |
 | `WHATSAPP_VERIFY_TOKEN` | any random string; entered in the webhook setup form |
-| `WHATSAPP_ALLOWED_SENDERS` | comma-separated numbers whose messages are accepted (default: the owner) |
 | `WHATSAPP_AGENT_URL`, `WHATSAPP_AGENT_TOKEN` | where to forward incoming messages; unset means log only |
 
 `WHATSAPP_TOKENS` (default `tokens`), `WHATSAPP_ADDR` (default `127.0.0.1:8751`), and `WHATSAPP_ALLOWED_HOSTS`
@@ -38,7 +38,7 @@ Environment (`.env`, untracked):
 ## Meta setup
 
 1. Create an app at developers.facebook.com with the WhatsApp use case. The free test number works for messaging
-   yourself; add your number as a recipient.
+   the agent's contacts; add each contact's number as a recipient.
 2. For a permanent token, add a system user in Business settings, assign it the app and the WhatsApp account, and
    generate a token that never expires with `whatsapp_business_messaging` and `whatsapp_business_management`.
 3. Configure the webhook: callback URL `https://<your domain>/webhook`, your verify token, and subscribe to

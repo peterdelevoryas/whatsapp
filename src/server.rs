@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use axum::http::request::Parts;
 use rmcp::{
     ErrorData, ServerHandler,
@@ -11,26 +13,26 @@ use rmcp::{
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::{auth, whatsapp};
+use crate::{auth, contacts::Contacts, whatsapp};
 
 // WhatsApp's limit on a text message body.
 const MAX_TEXT_CHARS: usize = 4096;
 
+// Followed by the contact list.
 const INSTRUCTIONS: &str = "\
-Sends the user WhatsApp messages. Use it to reach them when they aren't \
-watching this session: a long task finished, a scheduled check-in, something \
-that needs their attention. Messages always go to the user; there's no \
-recipient to choose.";
+A WhatsApp phone number. whatsapp_send sends a text message from it to one of \
+its contacts, by name; it can't message anyone else. Contacts: ";
 
 #[derive(Clone)]
 pub struct WhatsAppServer {
     whatsapp: whatsapp::Client,
-    /// The only number this server sends to.
-    owner: String,
+    contacts: Arc<Contacts>,
 }
 
 #[derive(Deserialize, JsonSchema)]
 pub struct SendParams {
+    /// The contact's name, as listed in the server instructions.
+    pub to: String,
     /// The message, up to 4096 characters. Plain text; WhatsApp renders
     /// *bold*, _italic_, and `code`.
     pub text: String,
@@ -44,15 +46,15 @@ pub struct Sent {
 
 #[tool_router]
 impl WhatsAppServer {
-    pub fn new(whatsapp: whatsapp::Client, owner: String) -> Self {
-        Self { whatsapp, owner }
+    pub fn new(whatsapp: whatsapp::Client, contacts: Arc<Contacts>) -> Self {
+        Self { whatsapp, contacts }
     }
 
     #[tool(
-        description = "Send the user a WhatsApp message. It always goes to the user; \
-            there's no recipient to choose. WhatsApp only delivers these within 24 \
-            hours of the user's last message to this number; outside that window \
-            this fails and says so.",
+        description = "Send a WhatsApp text message to a contact, by name. Only \
+            contacts can be messaged. WhatsApp only delivers these within 24 hours of \
+            the contact's last message to this number; outside that window this fails \
+            and says so.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -75,13 +77,23 @@ impl WhatsAppServer {
                 None,
             ));
         }
-        match self.whatsapp.send_text(&self.owner, &p.text).await {
+        let Some(contact) = self.contacts.by_name(&p.to) else {
+            return Err(ErrorData::invalid_params(
+                format!(
+                    "{:?} isn't a contact; contacts: {}",
+                    p.to,
+                    self.contacts.names().join(", ")
+                ),
+                None,
+            ));
+        };
+        match self.whatsapp.send_text(&contact.number, &p.text).await {
             Ok(message_id) => {
-                tracing::info!(source = %client.source, %message_id, chars, "sent");
+                tracing::info!(source = %client.source, to = %contact.name, %message_id, chars, "sent");
                 Ok(Json(Sent { message_id }))
             }
             Err(e) => {
-                tracing::warn!(source = %client.source, "send failed: {e:#}");
+                tracing::warn!(source = %client.source, to = %contact.name, "send failed: {e:#}");
                 Err(ErrorData::internal_error(format!("{e:#}"), None))
             }
         }
@@ -93,6 +105,9 @@ impl ServerHandler for WhatsAppServer {
     fn get_info(&self) -> ServerConfig {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new("whatsapp", env!("CARGO_PKG_VERSION")))
-            .with_instructions(INSTRUCTIONS)
+            .with_instructions(format!(
+                "{INSTRUCTIONS}{}.",
+                self.contacts.names().join(", ")
+            ))
     }
 }
