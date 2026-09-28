@@ -112,6 +112,7 @@ async fn serve() -> Result<()> {
         contacts.clone(),
         agent,
         store.clone(),
+        whatsapp.clone(),
     );
     let tokens = auth::Tokens::load(&tokens_path)?;
 

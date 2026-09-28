@@ -19,12 +19,17 @@ CREATE TABLE IF NOT EXISTS messages (
   status    TEXT,              -- outgoing only: sent, delivered, read, failed
   status_at TEXT,
   error     TEXT,              -- why delivery failed
-  source    TEXT               -- outgoing only: the client that sent it
+  source    TEXT,              -- outgoing only: the client that sent it
+  reply_to  TEXT,              -- the message this one quotes
+  read_at   TEXT               -- incoming only: when it was marked read
 );
 CREATE INDEX IF NOT EXISTS messages_contact_at ON messages (contact, at);
 ";
 
-const COLUMNS: &str = "id, direction, kind, text, at, status, status_at, error";
+// Columns added after the first release, for databases created before them.
+const ADDED_COLUMNS: [&str; 2] = ["reply_to", "read_at"];
+
+const COLUMNS: &str = "id, direction, kind, text, at, status, status_at, error, reply_to";
 
 #[derive(Debug, Clone, Serialize, JsonSchema, PartialEq)]
 pub struct Message {
@@ -46,6 +51,9 @@ pub struct Message {
     /// Outgoing only: why delivery failed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// The ID of the message this one quotes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reply_to: Option<String>,
 }
 
 pub struct Incoming<'a> {
@@ -54,6 +62,7 @@ pub struct Incoming<'a> {
     pub kind: &'a str,
     pub text: Option<&'a str>,
     pub at: String,
+    pub reply_to: Option<&'a str>,
 }
 
 #[derive(Clone)]
@@ -71,6 +80,7 @@ impl Store {
         conn.execute_batch(TABLES)
             .await
             .context("creating tables")?;
+        add_columns(&conn).await.context("migrating schema")?;
         drop(conn);
         Ok(Self { db })
     }
@@ -99,14 +109,15 @@ impl Store {
         let changed = self
             .conn()?
             .execute(
-                "INSERT OR IGNORE INTO messages (id, contact, direction, kind, text, at) \
-                 VALUES (?1, ?2, 'in', ?3, ?4, ?5)",
+                "INSERT OR IGNORE INTO messages (id, contact, direction, kind, text, at, reply_to) \
+                 VALUES (?1, ?2, 'in', ?3, ?4, ?5, ?6)",
                 vec![
                     Value::Text(m.id.to_string()),
                     Value::Text(m.contact.to_string()),
                     Value::Text(m.kind.to_string()),
                     opt_text(m.text),
                     Value::Text(m.at),
+                    opt_text(m.reply_to),
                 ],
             )
             .await?;
@@ -119,20 +130,22 @@ impl Store {
         id: &str,
         contact: &str,
         text: &str,
+        reply_to: Option<&str>,
         source: &str,
     ) -> Result<()> {
         let now = now();
         self.conn()?
             .execute(
                 "INSERT OR IGNORE INTO messages \
-                 (id, contact, direction, kind, text, at, status, status_at, source) \
-                 VALUES (?1, ?2, 'out', 'text', ?3, ?4, 'sent', ?4, ?5)",
+                 (id, contact, direction, kind, text, at, status, status_at, source, reply_to) \
+                 VALUES (?1, ?2, 'out', 'text', ?3, ?4, 'sent', ?4, ?5, ?6)",
                 vec![
                     Value::Text(id.to_string()),
                     Value::Text(contact.to_string()),
                     Value::Text(text.to_string()),
                     Value::Text(now),
                     Value::Text(source.to_string()),
+                    opt_text(reply_to),
                 ],
             )
             .await?;
@@ -178,6 +191,79 @@ impl Store {
             ],
         )
         .await?;
+        Ok(())
+    }
+
+    /// The message `id` in the conversation with `contact`, if there is one.
+    pub async fn find(&self, contact: &str, id: &str) -> Result<Option<Message>> {
+        let mut rows = self
+            .conn()?
+            .query(
+                format!("SELECT {COLUMNS} FROM messages WHERE id = ?1 AND contact = ?2"),
+                vec![
+                    Value::Text(id.to_string()),
+                    Value::Text(contact.to_string()),
+                ],
+            )
+            .await?;
+        match rows.next().await? {
+            Some(row) => Ok(Some(row_to_message(&row)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// How many of `contact`'s messages haven't been marked read.
+    pub async fn unread_count(&self, contact: &str) -> Result<u64> {
+        let mut rows = self
+            .conn()?
+            .query(
+                "SELECT count(*) FROM messages \
+                 WHERE contact = ?1 AND direction = 'in' AND read_at IS NULL",
+                vec![Value::Text(contact.to_string())],
+            )
+            .await?;
+        let row = rows.next().await?.context("count returned no rows")?;
+        match row.get_value(0)? {
+            Value::Integer(n) => Ok(n as u64),
+            other => bail!("count: expected an integer, got {other:?}"),
+        }
+    }
+
+    /// The ID of `contact`'s most recent message to this number.
+    pub async fn latest_incoming(&self, contact: &str) -> Result<Option<String>> {
+        let mut rows = self
+            .conn()?
+            .query(
+                "SELECT id FROM messages WHERE contact = ?1 AND direction = 'in' \
+                 ORDER BY at DESC, id DESC LIMIT 1",
+                vec![Value::Text(contact.to_string())],
+            )
+            .await?;
+        match rows.next().await? {
+            Some(row) => text(&row, 0),
+            None => Ok(None),
+        }
+    }
+
+    /// Records that `contact`'s message `id`, and every earlier one, was read,
+    /// as WhatsApp does when one message is marked read.
+    pub async fn mark_read_through(&self, contact: &str, id: &str) -> Result<()> {
+        let Some(message) = self.find(contact, id).await? else {
+            bail!("no message {id:?} in this conversation");
+        };
+        self.conn()?
+            .execute(
+                "UPDATE messages SET read_at = ?4 \
+                 WHERE contact = ?1 AND direction = 'in' AND read_at IS NULL \
+                   AND (at < ?2 OR (at = ?2 AND id <= ?3))",
+                vec![
+                    Value::Text(contact.to_string()),
+                    Value::Text(message.at),
+                    Value::Text(id.to_string()),
+                    Value::Text(now()),
+                ],
+            )
+            .await?;
         Ok(())
     }
 
@@ -254,6 +340,29 @@ impl Store {
     }
 }
 
+async fn add_columns(conn: &turso::Connection) -> Result<()> {
+    let mut rows = conn
+        .query("SELECT name FROM pragma_table_info('messages')", ())
+        .await?;
+    let mut existing = Vec::new();
+    while let Some(row) = rows.next().await? {
+        existing.push(required(&row, 0)?);
+    }
+    drop(rows);
+    for column in ADDED_COLUMNS {
+        if !existing.iter().any(|c| c == column) {
+            tracing::info!(column, "adding column to messages");
+            // In an explicit transaction: turso 0.7.2 otherwise applies the
+            // ALTER only to this connection, and it never reaches the file.
+            conn.execute_batch(format!(
+                "BEGIN IMMEDIATE; ALTER TABLE messages ADD COLUMN {column} TEXT; COMMIT;"
+            ))
+            .await?;
+        }
+    }
+    Ok(())
+}
+
 fn status_rank(status: &str) -> Option<u8> {
     match status {
         "sent" => Some(1),
@@ -285,6 +394,7 @@ fn row_to_message(row: &turso::Row) -> Result<Message> {
         status: text(row, 5)?,
         status_at: text(row, 6)?,
         error: text(row, 7)?,
+        reply_to: text(row, 8)?,
     })
 }
 
@@ -330,6 +440,7 @@ mod tests {
             kind: "text",
             text: Some(text),
             at: at.to_string(),
+            reply_to: None,
         }
     }
 
@@ -347,7 +458,7 @@ mod tests {
         );
         s.record_incoming(incoming("b", "there", "2026-09-28T10:00:00Z"))
             .await?;
-        s.record_outgoing("c", "15551234567", "hello", "test")
+        s.record_outgoing("c", "15551234567", "hello", Some("a"), "test")
             .await?;
         assert_eq!(s.count().await?, 3);
 
@@ -374,7 +485,7 @@ mod tests {
     #[tokio::test]
     async fn statuses_only_move_forward() -> Result<()> {
         let s = store().await;
-        s.record_outgoing("m", "15551234567", "hello", "test")
+        s.record_outgoing("m", "15551234567", "hello", None, "test")
             .await?;
         s.record_status("m", "read", "2026-09-28T10:02:00Z".into(), None)
             .await?;
@@ -392,6 +503,58 @@ mod tests {
             .await?;
         s.record_status("m", "weird", "2026-09-28T10:04:00Z".into(), None)
             .await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn replies_and_read_receipts() -> Result<()> {
+        let s = store().await;
+        s.record_incoming(incoming("a", "one", "2026-09-28T10:00:00Z"))
+            .await?;
+        s.record_incoming(incoming("b", "two", "2026-09-28T10:01:00Z"))
+            .await?;
+        s.record_incoming(incoming("c", "three", "2026-09-28T10:02:00Z"))
+            .await?;
+        s.record_outgoing("d", "15551234567", "re: two", Some("b"), "test")
+            .await?;
+        let d = s.find("15551234567", "d").await?.unwrap();
+        assert_eq!(d.reply_to.as_deref(), Some("b"));
+        assert!(s.find("19999999999", "d").await?.is_none());
+
+        assert_eq!(s.unread_count("15551234567").await?, 3);
+        s.mark_read_through("15551234567", "b").await?;
+        assert_eq!(s.unread_count("15551234567").await?, 1);
+        assert_eq!(
+            s.latest_incoming("15551234567").await?.as_deref(),
+            Some("c")
+        );
+        s.mark_read_through("15551234567", "c").await?;
+        assert_eq!(s.unread_count("15551234567").await?, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn adds_columns_to_old_databases() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!("whatsapp-migrate-{}", std::process::id()));
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join("old.db");
+        let _ = std::fs::remove_file(&path);
+        {
+            let db = Builder::new_local(path.to_str().unwrap()).build().await?;
+            db.connect()?
+                .execute_batch(
+                    "CREATE TABLE messages (id TEXT PRIMARY KEY, contact TEXT NOT NULL, \
+                     direction TEXT NOT NULL, kind TEXT NOT NULL, text TEXT, at TEXT NOT NULL, \
+                     status TEXT, status_at TEXT, error TEXT, source TEXT); \
+                     INSERT INTO messages (id, contact, direction, kind, text, at) \
+                     VALUES ('old', '15551234567', 'in', 'text', 'hi', '2026-09-28T10:00:00Z');",
+                )
+                .await?;
+        }
+        let s = Store::open(path.to_str().unwrap()).await?;
+        let old = s.find("15551234567", "old").await?.unwrap();
+        assert_eq!(old.text.as_deref(), Some("hi"));
+        assert_eq!(s.unread_count("15551234567").await?, 1);
         Ok(())
     }
 

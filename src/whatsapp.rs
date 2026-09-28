@@ -30,19 +30,47 @@ impl Client {
         }
     }
 
-    /// Sends `text` to `to` (digits with country code) and returns WhatsApp's message ID.
-    pub async fn send_text(&self, to: &str, text: &str) -> Result<String> {
-        let body = json!({
+    /// Sends `text` to `to` (digits with country code) and returns WhatsApp's
+    /// message ID. With `reply_to`, it quotes that message.
+    pub async fn send_text(&self, to: &str, text: &str, reply_to: Option<&str>) -> Result<String> {
+        let mut body = json!({
             "messaging_product": "whatsapp",
             "to": to,
             "type": "text",
             "text": { "body": text }
         });
+        if let Some(reply_to) = reply_to {
+            body["context"] = json!({ "message_id": reply_to });
+        }
+        let reply = self.post_message(&body).await?;
+        let id = reply["messages"][0]["id"]
+            .as_str()
+            .context("WhatsApp API reply had no message ID")?;
+        Ok(id.to_string())
+    }
+
+    /// Marks an incoming message, and everything before it in the
+    /// conversation, as read (blue ticks). With `typing`, the contact also sees
+    /// "typing…" until this number replies or about 25 seconds pass.
+    pub async fn mark_read(&self, message_id: &str, typing: bool) -> Result<()> {
+        let mut body = json!({
+            "messaging_product": "whatsapp",
+            "status": "read",
+            "message_id": message_id
+        });
+        if typing {
+            body["typing_indicator"] = json!({ "type": "text" });
+        }
+        self.post_message(&body).await?;
+        Ok(())
+    }
+
+    async fn post_message(&self, body: &Value) -> Result<Value> {
         let resp = self
             .http
             .post(format!("{API_URL}/{}/messages", self.phone_number_id))
             .bearer_auth(&self.access_token)
-            .json(&body)
+            .json(body)
             .send()
             .await
             .context("sending to the WhatsApp API")?;
@@ -62,9 +90,6 @@ impl Client {
             }
             bail!("WhatsApp API returned {status}: {message}");
         }
-        let id = reply["messages"][0]["id"]
-            .as_str()
-            .context("WhatsApp API reply had no message ID")?;
-        Ok(id.to_string())
+        Ok(reply)
     }
 }

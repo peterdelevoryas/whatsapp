@@ -3,8 +3,8 @@
 //! rejected. Messages from anyone who isn't a contact are dropped without a
 //! reply, so a stranger can't tell the number is live. Contacts' messages are
 //! logged, and text messages are forwarded to the agent's input endpoint, if
-//! one is configured. Delivery statuses for messages this number sent are
-//! logged too.
+//! one is configured; once the agent has them, they're marked read. Delivery
+//! statuses for messages this number sent are logged too.
 
 use std::sync::Arc;
 
@@ -22,6 +22,7 @@ use sha2::Sha256;
 use crate::{
     contacts::Contacts,
     store::{self, Incoming, Store},
+    whatsapp,
 };
 
 #[derive(Clone)]
@@ -33,6 +34,7 @@ struct Inner {
     contacts: Arc<Contacts>,
     agent: Option<Agent>,
     store: Store,
+    whatsapp: whatsapp::Client,
     http: reqwest::Client,
 }
 
@@ -50,6 +52,7 @@ impl Webhook {
         contacts: Arc<Contacts>,
         agent: Option<Agent>,
         store: Store,
+        whatsapp: whatsapp::Client,
     ) -> Self {
         Self(Arc::new(Inner {
             app_secret,
@@ -57,6 +60,7 @@ impl Webhook {
             contacts,
             agent,
             store,
+            whatsapp,
             http: reqwest::Client::new(),
         }))
     }
@@ -125,6 +129,8 @@ pub async fn receive(
             continue;
         };
         let text = message["text"]["body"].as_str();
+        // Set when the contact quoted a message in their reply.
+        let reply_to = message["context"]["id"].as_str();
         let at = message["timestamp"]
             .as_str()
             .and_then(store::from_unix)
@@ -135,6 +141,7 @@ pub async fn receive(
             kind,
             text,
             at,
+            reply_to,
         };
         match w.store.record_incoming(incoming).await {
             Ok(true) => {}
@@ -151,13 +158,25 @@ pub async fn receive(
             tracing::info!(id, kind, "logged non-text message; not forwarded");
             continue;
         };
-        let input = json!({
+        let mut input = json!({
             "channel": "whatsapp",
             "sender": from,
             "sender_name": contact.name,
             "message_id": id,
             "text": text,
         });
+        if let Some(reply_to) = reply_to {
+            // Include what was quoted, so the agent needn't look it up.
+            let quoted = match w.store.find(from, reply_to).await {
+                Ok(Some(m)) => m.text,
+                Ok(None) => None,
+                Err(e) => {
+                    tracing::warn!(id, "looking up quoted message failed: {e:#}");
+                    None
+                }
+            };
+            input["reply_to"] = json!({ "message_id": reply_to, "text": quoted });
+        }
         let w = w.clone();
         tokio::spawn(async move { forward(&w, input).await });
     }
@@ -211,10 +230,22 @@ async fn forward(w: &Inner, input: Value) {
         tracing::info!(%id, "received message; no agent configured, so not forwarded");
         return;
     };
-    match post_to_agent(w, agent, &input).await {
-        Ok(()) => tracing::info!(%id, "forwarded message to the agent"),
-        Err(e) => tracing::error!(%id, "forwarding to the agent failed: {e}"),
+    if let Err(e) = post_to_agent(w, agent, &input).await {
+        tracing::error!(%id, "forwarding to the agent failed: {e}");
+        return;
     }
+    tracing::info!(%id, "forwarded message to the agent");
+    // The agent has it now: show the contact blue ticks.
+    let sender = input["sender"].as_str().unwrap_or_default();
+    if let Err(e) = mark_read(w, sender, &id).await {
+        tracing::warn!(%id, "marking read failed: {e:#}");
+    }
+}
+
+async fn mark_read(w: &Inner, contact: &str, id: &str) -> anyhow::Result<()> {
+    w.whatsapp.mark_read(id, false).await?;
+    w.store.mark_read_through(contact, id).await?;
+    Ok(())
 }
 
 async fn post_to_agent(w: &Inner, agent: &Agent, input: &Value) -> reqwest::Result<()> {

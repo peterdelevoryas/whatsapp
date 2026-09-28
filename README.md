@@ -3,13 +3,17 @@
 A WhatsApp relay: one WhatsApp number, on the official Cloud API, given to an agent as its own phone. It does two
 things:
 
-- **Send and read:** an MCP server. `whatsapp_send(to, text)` messages one of the number's contacts by name; it
-  can't message anyone else, so a leaked client token can't be used to spam strangers. `whatsapp_conversations()`
-  lists conversations (last message, and whether the 24-hour window for free-form messages is open), and
-  `whatsapp_history(contact, limit, before)` pages through one.
+- **Send and read:** an MCP server. `whatsapp_send(to, text, reply_to?)` messages one of the number's contacts by
+  name, optionally quoting one of their messages; it can't message anyone else, so a leaked client token can't be
+  used to spam strangers. `whatsapp_conversations()` lists conversations (unread count, last message, and whether
+  the 24-hour window for free-form messages is open), `whatsapp_history(contact, limit, before)` pages through one,
+  and `whatsapp_typing(contact)` shows the contact "typing…" while a reply is being prepared.
+- **Read receipts:** a contact's messages are marked read (blue ticks) once the agent has them, or when a client
+  reads the newest page of the conversation.
 - **Receive:** a webhook for incoming messages. It checks Meta's `X-Hub-Signature-256`, drops messages from anyone
   who isn't a contact (without replying, so strangers can't tell the number is live), and forwards text messages to
-  the agent's input endpoint as `{"channel": "whatsapp", "sender", "sender_name", "message_id", "text"}`.
+  the agent's input endpoint as `{"channel": "whatsapp", "sender", "sender_name", "message_id", "text"}`, plus
+  `"reply_to": {"message_id", "text"}` when the contact quoted a message.
 
 The Cloud API keeps no history you can query: incoming messages reach the webhook once, and sent messages exist only
 in your own record. So the relay logs every message to and from its contacts, plus delivery statuses (sent,
