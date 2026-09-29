@@ -140,6 +140,10 @@ async fn serve() -> Result<()> {
     );
     let app = axum::Router::new()
         .nest_service("/mcp", mcp)
+        .route(
+            "/inbox",
+            axum::routing::get(webhook::inbox).with_state(webhook.clone()),
+        )
         .layer(axum::middleware::from_fn_with_state(
             tokens.clone(),
             auth::middleware,

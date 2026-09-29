@@ -25,6 +25,9 @@ use crate::{
     whatsapp,
 };
 
+// Most messages one /inbox call returns.
+const INBOX_LIMIT: u32 = 100;
+
 #[derive(Clone)]
 pub struct Webhook(Arc<Inner>);
 
@@ -158,25 +161,18 @@ pub async fn receive(
             tracing::info!(id, kind, "logged non-text message; not forwarded");
             continue;
         };
-        let mut input = json!({
-            "channel": "whatsapp",
-            "sender": from,
-            "sender_name": contact.name,
-            "message_id": id,
-            "text": text,
-        });
-        if let Some(reply_to) = reply_to {
-            // Include what was quoted, so the agent needn't look it up.
-            let quoted = match w.store.find(from, reply_to).await {
-                Ok(Some(m)) => m.text,
-                Ok(None) => None,
-                Err(e) => {
-                    tracing::warn!(id, "looking up quoted message failed: {e:#}");
-                    None
-                }
-            };
-            input["reply_to"] = json!({ "message_id": reply_to, "text": quoted });
-        }
+        let seq = match w.store.seq_of(id).await {
+            Ok(Some(seq)) => seq,
+            Ok(None) => {
+                tracing::error!(id, "logged message has no sequence number");
+                continue;
+            }
+            Err(e) => {
+                tracing::error!(id, "looking up sequence number failed: {e:#}");
+                continue;
+            }
+        };
+        let input = agent_input(&w.store, seq, &contact.name, from, id, text, reply_to).await;
         let w = w.clone();
         tokio::spawn(async move { forward(&w, input).await });
     }
@@ -199,6 +195,83 @@ pub async fn receive(
         }
     }
     StatusCode::OK
+}
+
+/// A contact's message in the shape the agent's input endpoint takes, for both
+/// pushes (forwarding) and pulls (`/inbox`). `seq` lets the agent tell which
+/// messages it has already seen.
+async fn agent_input(
+    store: &Store,
+    seq: i64,
+    name: &str,
+    number: &str,
+    id: &str,
+    text: &str,
+    reply_to: Option<&str>,
+) -> Value {
+    let mut input = json!({
+        "channel": "whatsapp",
+        "seq": seq,
+        "sender": number,
+        "sender_name": name,
+        "message_id": id,
+        "text": text,
+    });
+    if let Some(reply_to) = reply_to {
+        // Include what was quoted, so the agent needn't look it up.
+        let quoted = match store.find(number, reply_to).await {
+            Ok(Some(m)) => m.text,
+            Ok(None) => None,
+            Err(e) => {
+                tracing::warn!(id, "looking up quoted message failed: {e:#}");
+                None
+            }
+        };
+        input["reply_to"] = json!({ "message_id": reply_to, "text": quoted });
+    }
+    input
+}
+
+#[derive(Deserialize)]
+pub struct InboxParams {
+    /// Sequence number of the last message the caller has; 0 for everything.
+    #[serde(default)]
+    after: i64,
+    limit: Option<u32>,
+}
+
+/// `GET /inbox?after=N`: contacts' text messages logged after N, oldest
+/// first, in the same shape as forwarded ones. The agent catches up with it
+/// after being away. Behind the same bearer tokens as /mcp.
+pub async fn inbox(
+    State(Webhook(w)): State<Webhook>,
+    Query(p): Query<InboxParams>,
+) -> Result<axum::Json<Value>, StatusCode> {
+    let limit = p.limit.unwrap_or(INBOX_LIMIT).clamp(1, INBOX_LIMIT);
+    let received = w.store.received_after(p.after, limit).await.map_err(|e| {
+        tracing::error!("reading inbox failed: {e:#}");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    let mut messages = Vec::new();
+    for r in received {
+        // Someone removed from the contacts isn't passed on.
+        let Some(contact) = w.contacts.by_number(&r.contact) else {
+            continue;
+        };
+        let text = r.message.text.as_deref().unwrap_or_default();
+        let input = agent_input(
+            &w.store,
+            r.seq,
+            &contact.name,
+            &r.contact,
+            &r.message.id,
+            text,
+            r.message.reply_to.as_deref(),
+        )
+        .await;
+        messages.push(input);
+    }
+    Ok(axum::Json(json!({ "messages": messages })))
 }
 
 /// Every incoming message in a delivery.

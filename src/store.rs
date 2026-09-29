@@ -56,6 +56,14 @@ pub struct Message {
     pub reply_to: Option<String>,
 }
 
+/// A contact's message as the agent receives it; `seq` orders them.
+pub struct Received {
+    /// Increases with every message logged (the table's rowid; nothing is deleted).
+    pub seq: i64,
+    pub contact: String,
+    pub message: Message,
+}
+
 pub struct Incoming<'a> {
     pub id: &'a str,
     pub contact: &'a str,
@@ -192,6 +200,52 @@ impl Store {
         )
         .await?;
         Ok(())
+    }
+
+    /// The sequence number of the message `id`.
+    pub async fn seq_of(&self, id: &str) -> Result<Option<i64>> {
+        let mut rows = self
+            .conn()?
+            .query(
+                "SELECT rowid FROM messages WHERE id = ?1",
+                vec![Value::Text(id.to_string())],
+            )
+            .await?;
+        match rows.next().await? {
+            Some(row) => match row.get_value(0)? {
+                Value::Integer(n) => Ok(Some(n)),
+                other => bail!("rowid: expected an integer, got {other:?}"),
+            },
+            None => Ok(None),
+        }
+    }
+
+    /// Up to `limit` incoming text messages logged after sequence number
+    /// `after`, oldest first: what a client that was away has missed.
+    pub async fn received_after(&self, after: i64, limit: u32) -> Result<Vec<Received>> {
+        let mut rows = self
+            .conn()?
+            .query(
+                format!(
+                    "SELECT rowid, contact, {COLUMNS} FROM messages \
+                     WHERE rowid > ?1 AND direction = 'in' AND text IS NOT NULL \
+                     ORDER BY rowid LIMIT {limit}"
+                ),
+                vec![Value::Integer(after)],
+            )
+            .await?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await? {
+            let Value::Integer(seq) = row.get_value(0)? else {
+                bail!("rowid isn't an integer");
+            };
+            out.push(Received {
+                seq,
+                contact: required(&row, 1)?,
+                message: row_to_message_at(&row, 2)?,
+            });
+        }
+        Ok(out)
     }
 
     /// The message `id` in the conversation with `contact`, if there is one.
@@ -385,16 +439,21 @@ pub fn from_unix(timestamp: &str) -> Option<String> {
 }
 
 fn row_to_message(row: &turso::Row) -> Result<Message> {
+    row_to_message_at(row, 0)
+}
+
+/// Reads COLUMNS starting at column `start`.
+fn row_to_message_at(row: &turso::Row, start: usize) -> Result<Message> {
     Ok(Message {
-        id: required(row, 0)?,
-        direction: required(row, 1)?,
-        kind: required(row, 2)?,
-        text: text(row, 3)?,
-        at: required(row, 4)?,
-        status: text(row, 5)?,
-        status_at: text(row, 6)?,
-        error: text(row, 7)?,
-        reply_to: text(row, 8)?,
+        id: required(row, start)?,
+        direction: required(row, start + 1)?,
+        kind: required(row, start + 2)?,
+        text: text(row, start + 3)?,
+        at: required(row, start + 4)?,
+        status: text(row, start + 5)?,
+        status_at: text(row, start + 6)?,
+        error: text(row, start + 7)?,
+        reply_to: text(row, start + 8)?,
     })
 }
 
@@ -530,6 +589,27 @@ mod tests {
         );
         s.mark_read_through("15551234567", "c").await?;
         assert_eq!(s.unread_count("15551234567").await?, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn lists_received_messages_after_a_sequence_number() -> Result<()> {
+        let s = store().await;
+        s.record_incoming(incoming("a", "one", "2026-09-28T10:00:00Z"))
+            .await?;
+        s.record_outgoing("b", "15551234567", "reply", None, "test")
+            .await?;
+        s.record_incoming(incoming("c", "two", "2026-09-28T10:02:00Z"))
+            .await?;
+        let all = s.received_after(0, 10).await?;
+        assert_eq!(all.len(), 2, "outgoing messages aren't listed");
+        assert_eq!(all[0].message.id, "a");
+        assert!(all[0].seq < all[1].seq);
+        assert_eq!(s.seq_of("c").await?, Some(all[1].seq));
+        let rest = s.received_after(all[0].seq, 10).await?;
+        assert_eq!(rest.len(), 1);
+        assert_eq!(rest[0].message.id, "c");
+        assert_eq!(rest[0].contact, "15551234567");
         Ok(())
     }
 
