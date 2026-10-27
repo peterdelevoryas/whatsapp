@@ -61,7 +61,8 @@ configure the server itself.
 ## Production
 
 Runs on any Linux server you can SSH into as root (set up with `deploy/cloud-init.yaml`, written for Ubuntu 24.04),
-behind Caddy for HTTPS. Its hostname lives in `deploy/config` (untracked; copy `deploy/config.example`).
+on a private network behind an edge server whose Caddy terminates HTTPS and proxies to it. Its hostname and
+private IP live in `deploy/config` (untracked; copy `deploy/config.example`).
 The message log lives on a block-storage volume mounted at `/var/lib/whatsapp`, so the server itself is disposable;
 the service won't start unless that path is a mount point, so a missing volume can't turn into an empty log.
 
